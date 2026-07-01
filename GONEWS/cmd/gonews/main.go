@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -43,15 +44,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("Ошибка подключения к БД: %v", err)
 	}
-	defer db.Close()
 
-	// Инициализация схемы БД
-	schema, err := os.ReadFile("../../schema.sql")
+	// Инициализация схемы БД — пробуем несколько путей
+	schema, schemaPath, err := loadSchema()
 	if err != nil {
-		log.Fatalf("Ошибка чтения схемы БД: %v", err)
+		log.Fatalf("Ошибка загрузки схемы БД: %v", err)
 	}
+	log.Printf("Схема БД загружена из: %s", schemaPath)
 
-	if err := db.InitSchema(string(schema)); err != nil {
+	if err := db.InitSchema(schema); err != nil {
 		log.Fatalf("Ошибка инициализации схемы БД: %v", err)
 	}
 
@@ -66,8 +67,13 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// WaitGroup для ожидания завершения воркеров
+	var wg sync.WaitGroup
+
 	// Воркер для сохранения публикаций в БД
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for post := range postsChan {
 			if err := db.SavePost(post); err != nil {
 				log.Printf("Ошибка сохранения поста: %v", err)
@@ -76,7 +82,9 @@ func main() {
 	}()
 
 	// Воркер для логирования ошибок
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for err := range errorChan {
 			log.Printf("Ошибка: %v", err)
 		}
@@ -125,41 +133,72 @@ func main() {
 	// Создание и настройка API сервера
 	apiServer := api.NewAPI(db)
 
-	// Запуск HTTP сервера
+	// Формирование адреса
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
-	log.Printf("Сервер запущен на %s", addr)
 
 	server := &http.Server{
 		Addr:    addr,
 		Handler: apiServer,
 	}
 
+	// Запуск HTTP сервера в отдельной горутине
+	go func() {
+		log.Printf("[*] GONEWS HTTP server is started on %s", addr)
+		log.Println("[*] Endpoints:")
+		log.Println("    GET /news/{n}[?s=...][&page=...]")
+		log.Println("    GET /news/detail/{id}")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Ошибка сервера: %v", err)
+		}
+	}()
+
 	// Обработка сигналов завершения (Ctrl+C)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigChan
 
-	go func() {
-		<-sigChan
-		log.Println("Получен сигнал остановки...")
-		cancel()
+	log.Printf("[*] GONEWS HTTP server has been stopped. Reason: got %s", sig)
 
-		// Graceful shutdown с таймаутом
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer shutdownCancel()
+	// Graceful shutdown
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
 
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("Ошибка остановки сервера: %v", err)
-		}
-
-		close(postsChan)
-		close(errorChan)
-	}()
-
-	if err := server.ListenAndServe(); err != http.ErrServerClosed {
-		log.Fatalf("Ошибка сервера: %v", err)
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Ошибка остановки HTTP-сервера: %v", err)
 	}
 
-	log.Println("Сервер остановлен")
+	cancel()
+	close(postsChan)
+	close(errorChan)
+	wg.Wait()
+
+	if err := db.Close(); err != nil {
+		log.Printf("Ошибка закрытия БД: %v", err)
+	}
+
+	log.Println("[*] GONEWS has been gracefully shut down")
+}
+
+// loadSchema пробует несколько путей для загрузки schema.sql
+// Это решает проблему зависимости от рабочей директории
+func loadSchema() (string, string, error) {
+	possiblePaths := []string{
+		"../../../schema.sql",     // запуск из cmd/gonews/
+		"./schema.sql",            // запуск из GONEWS/
+		"./cmd/gonews/schema.sql", // запуск из GONEWS/ (файл рядом с main.go)
+		"../../schema.sql",        // запуск из GONEWS/ (если файл в корне monorepo)
+	}
+
+	var lastErr error
+	for _, path := range possiblePaths {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			return string(data), path, nil
+		}
+		lastErr = err
+	}
+
+	return "", "", fmt.Errorf("не удалось найти schema.sql ни по одному из путей. Последняя ошибка: %v", lastErr)
 }
 
 // loadConfig загружает и парсит файл конфигурации JSON

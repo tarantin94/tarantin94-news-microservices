@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"time"
 
-	"../models"
+	"apigateway/models"
 )
 
 // Hard-coded данные. В боевом проекте они придут из News-сервиса.
